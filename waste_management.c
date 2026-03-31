@@ -28,11 +28,28 @@
  ╚══════════════════════════════════════════════════════════════════════╝
 */
 
+#ifdef __APPLE__
+#include <GLUT/glut.h>
+#else
 #include <GL/glut.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ══════════════════════════════════════════════════════
+   CONFIGURATION
+   ══════════════════════════════════════════════════════ */
+#define TRUCK_SPEED_BASE     50.0f
+#define BIN_ALERT_THRESHOLD  0.75f
+#define PARTICLE_GRAVITY     20.0f
+#define FLAME_LAYERS         6
+#define GLOW_LAYERS          6
+#define TRANSITION_DURATION  1.2f
+#define VIGNETTE_STRENGTH    0.45f
+#define MOTION_BLUR_ALPHA    0.12f
+#define SECONDARY_MOTION_AMP 2.0f
 
 /* ══════════════════════════════════════════════════════
    CONSTANTS & GLOBALS
@@ -59,6 +76,11 @@ static int    paused= 0;
 static int    lastMs= 0;
 static float  fps   = 60.0f;
 
+/* Transition system */
+static int    prev_scene = -1;
+static float  trans_timer = 0.0f;
+static int    in_transition = 0;
+
 /* ══════════════════════════════════════════════════════
    MATH HELPERS
    ══════════════════════════════════════════════════════ */
@@ -67,8 +89,16 @@ static float lerpf(float a,float b,float t){ return a+(b-a)*clamp01(t); }
 static float smoothstep(float t){ t=clamp01(t); return t*t*(3-2*t); }
 static float ease_out(float t){ t=clamp01(t); return 1-(1-t)*(1-t); }
 static float ease_in(float t){ t=clamp01(t); return t*t; }
+static float ease_in_out(float t){ t=clamp01(t); return t<0.5f?2*t*t:1-powf(-2*t+2,2)/2; }
+static float bounce_out(float t){ t=clamp01(t); if(t<1/2.75f) return 7.5625f*t*t; else if(t<2/2.75f){t-=1.5f/2.75f;return 7.5625f*t*t+0.75f;} else if(t<2.5f/2.75f){t-=2.25f/2.75f;return 7.5625f*t*t+0.9375f;} else{t-=2.625f/2.75f;return 7.5625f*t*t+0.984375f;} }
 static float pulse(float freq){ return 0.5f+0.5f*sinf(gt*freq); }
 static float wave(float freq,float phase){ return sinf(gt*freq+phase); }
+
+/* Bezier interpolation for curved paths */
+static float bezier3(float p0,float p1,float p2,float p3,float t){
+    float u=1-t;
+    return u*u*u*p0+3*u*u*t*p1+3*u*t*t*p2+t*t*t*p3;
+}
 
 /* Local scene time [0..1] */
 static float st(float s, float e){ return clamp01((gt-s)/(e-s)); }
@@ -200,20 +230,137 @@ static float fade_alpha(float s, float e){
 }
 
 /* ══════════════════════════════════════════════════════
-   SHARED VISUAL: Particle system
+   ADVANCED VISUAL EFFECTS
    ══════════════════════════════════════════════════════ */
-#define MAX_PARTICLES 300
-typedef struct{ float x,y,vx,vy,life,maxlife,r,g,b,size; } Particle;
+
+/* Multi-layered radial glow (additive blend) */
+static void drawGlow(float x,float y,float r,float cr,float cg,float cb){
+    BlendAdd();
+    for(int i=GLOW_LAYERS;i>=1;i--){
+        float rr=r*i/(float)GLOW_LAYERS;
+        float a=0.07f*(GLOW_LAYERS+1-i);
+        Col4(cr,cg,cb,a);
+        Circle(x,y,rr,24);
+    }
+    BlendOff();
+}
+
+/* Soft elliptical shadow beneath objects */
+static void drawShadow(float x,float y,float w,float h){
+    BlendOn();
+    Col4(0,0,0,0.22f);
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex2f(x,y);
+    for(int i=0;i<=24;i++){
+        float a=TAU*i/24.0f;
+        glVertex2f(x+cosf(a)*w,y+sinf(a)*h*0.3f);
+    }
+    glEnd();
+    BlendOff();
+}
+
+/* Triangular light cone (for streetlamps, headlights) */
+static void drawLightCone(float x,float y,float angle,float spread,float dist,
+                           float cr,float cg,float cb,float alpha){
+    BlendAdd();
+    float a1=(angle-spread/2)*PI/180.0f;
+    float a2=(angle+spread/2)*PI/180.0f;
+    /* Multi-layer fade */
+    for(int i=3;i>=1;i--){
+        float d=dist*i/3.0f;
+        float aa=alpha*0.12f*(4-i);
+        Col4(cr,cg,cb,aa);
+        glBegin(GL_TRIANGLES);
+        glVertex2f(x,y);
+        glVertex2f(x+cosf(a1)*d,y+sinf(a1)*d);
+        glVertex2f(x+cosf(a2)*d,y+sinf(a2)*d);
+        glEnd();
+    }
+    BlendOff();
+}
+
+/* Cinematic vignette - dark edges */
+static void drawVignette(void){
+    BlendOn();
+    /* Top */
+    RectGradV(0,H-130,W,130, 0,0,0,0, 0,0,0,VIGNETTE_STRENGTH);
+    /* Bottom */
+    RectGradV(0,0,W,100, 0,0,0,VIGNETTE_STRENGTH, 0,0,0,0);
+    /* Left */
+    Col4(0,0,0,VIGNETTE_STRENGTH*0.6f);
+    glBegin(GL_QUADS);
+    glColor4f(0,0,0,VIGNETTE_STRENGTH*0.6f); glVertex2f(0,0);
+    glColor4f(0,0,0,0);                      glVertex2f(140,0);
+    glColor4f(0,0,0,0);                      glVertex2f(140,H);
+    glColor4f(0,0,0,VIGNETTE_STRENGTH*0.6f); glVertex2f(0,H);
+    glEnd();
+    /* Right */
+    glBegin(GL_QUADS);
+    glColor4f(0,0,0,0);                      glVertex2f(W-140,0);
+    glColor4f(0,0,0,VIGNETTE_STRENGTH*0.6f); glVertex2f(W,0);
+    glColor4f(0,0,0,VIGNETTE_STRENGTH*0.6f); glVertex2f(W,H);
+    glColor4f(0,0,0,0);                      glVertex2f(W-140,H);
+    glEnd();
+    BlendOff();
+}
+
+/* Full-screen fade overlay for transitions */
+static void drawScreenFade(float alpha){
+    if(alpha<0.005f) return;
+    BlendOn();
+    Col4(0,0,0,alpha);
+    Rect(0,0,W,H);
+    BlendOff();
+}
+
+/* Typewriter text - shows chars up to a reveal count */
+static void TextPartial(float x,float y,const char*s,void*font,int chars_shown){
+    glRasterPos2f(x,y);
+    int i=0;
+    for(const char*c=s;*c && i<chars_shown;c++,i++)
+        glutBitmapCharacter(font,*c);
+}
+
+/* Centered typewriter text */
+static void TextCPartial(float cx,float y,const char*s,void*font,int chars_shown){
+    int w2=glutBitmapLength(font,(const unsigned char*)s)/2;
+    glRasterPos2f(cx-w2,y);
+    int i=0;
+    for(const char*c=s;*c && i<chars_shown;c++,i++)
+        glutBitmapCharacter(font,*c);
+}
+
+
+/* ══════════════════════════════════════════════════════
+   SHARED VISUAL: Enhanced Particle System
+   ══════════════════════════════════════════════════════ */
+#define MAX_PARTICLES 600
+/* Particle types: 0=default, 1=smoke, 2=spark, 3=leaf, 4=energy, 5=dust, 6=ember */
+typedef struct{
+    float x,y,vx,vy,life,maxlife,r,g,b,size;
+    int   type;    /* rendering style */
+    float drag;    /* velocity decay per second (0=none, 1=full stop) */
+    float grav;    /* gravity multiplier (1=normal, 0=none, -1=float up) */
+} Particle;
 static Particle parts[MAX_PARTICLES];
 static int nparts=0;
 
-static void SpawnParticle(float x,float y,float vx,float vy,float life,
-                           float r,float g,float b,float sz){
+/* Full-featured spawn */
+static void SpawnParticleEx(float x,float y,float vx,float vy,float life,
+                             float r,float g,float b,float sz,
+                             int type,float drag,float grav){
     if(nparts>=MAX_PARTICLES) return;
     Particle*p=&parts[nparts++];
     p->x=x; p->y=y; p->vx=vx; p->vy=vy;
     p->life=life; p->maxlife=life;
     p->r=r; p->g=g; p->b=b; p->size=sz;
+    p->type=type; p->drag=drag; p->grav=grav;
+}
+
+/* Legacy-compatible spawn (type=0, default gravity, no drag) */
+static void SpawnParticle(float x,float y,float vx,float vy,float life,
+                           float r,float g,float b,float sz){
+    SpawnParticleEx(x,y,vx,vy,life,r,g,b,sz, 0,0.0f,1.0f);
 }
 
 static void UpdateParticles(float dt){
@@ -221,8 +368,14 @@ static void UpdateParticles(float dt){
         Particle*p=&parts[i];
         p->life-=dt;
         if(p->life<=0){ parts[i]=parts[--nparts]; continue; }
+        /* Apply drag */
+        float d=1.0f-p->drag*dt*3.0f;
+        if(d<0) d=0;
+        p->vx*=d; p->vy*=d;
+        /* Move */
         p->x+=p->vx*dt; p->y+=p->vy*dt;
-        p->vy-=20.0f*dt; /* gravity */
+        /* Per-particle gravity */
+        p->vy-=PARTICLE_GRAVITY*p->grav*dt;
         i++;
     }
 }
@@ -232,8 +385,46 @@ static void DrawParticles(void){
     for(int i=0;i<nparts;i++){
         Particle*p=&parts[i];
         float a=p->life/p->maxlife;
-        Col4(p->r,p->g,p->b,a*0.8f);
-        Circle(p->x,p->y,p->size*a,8);
+        switch(p->type){
+            case 1: /* smoke — large, soft, alpha blend */
+                BlendOn();
+                Col4(p->r,p->g,p->b,a*0.25f);
+                Circle(p->x,p->y,p->size*(2.0f-a),16);
+                BlendAdd();
+                break;
+            case 2: /* spark — bright dot with short trail */
+                Col4(p->r,p->g,p->b,a);
+                Circle(p->x,p->y,p->size*a,6);
+                Col4(p->r,p->g,p->b,a*0.4f);
+                Circle(p->x-p->vx*0.03f,p->y-p->vy*0.03f,p->size*a*0.7f,6);
+                break;
+            case 3: /* leaf — tiny triangle, wobble */
+                Col4(p->r,p->g,p->b,a*0.7f);
+                {float wo=sinf(gt*4+p->x*0.1f)*4;
+                Tri(p->x+wo,p->y+p->size*a,
+                    p->x-p->size*a*0.6f+wo,p->y-p->size*a*0.5f,
+                    p->x+p->size*a*0.6f+wo,p->y-p->size*a*0.5f);}
+                break;
+            case 4: /* energy — bright glow */
+                Col4(p->r,p->g,p->b,a*0.9f);
+                Circle(p->x,p->y,p->size*a,8);
+                Col4(p->r,p->g,p->b,a*0.3f);
+                Circle(p->x,p->y,p->size*a*2.5f,12);
+                break;
+            case 5: /* dust — tiny, faint */
+                Col4(p->r,p->g,p->b,a*0.35f);
+                Circle(p->x,p->y,p->size*0.5f,6);
+                break;
+            case 6: /* ember — bright upward, flicker */
+                {float flk=0.5f+0.5f*sinf(gt*12+p->y);
+                Col4(p->r*flk+0.3f,p->g*flk,p->b,a*0.8f);
+                Circle(p->x,p->y,p->size*a,6);}
+                break;
+            default: /* original style */
+                Col4(p->r,p->g,p->b,a*0.8f);
+                Circle(p->x,p->y,p->size*a,8);
+                break;
+        }
     }
     BlendOff();
 }
@@ -243,33 +434,250 @@ static unsigned int rng=12345;
 static float frand(){ rng=rng*1664525+1013904223; return (rng&0xFFFF)/65535.0f; }
 
 /* ══════════════════════════════════════════════════════
+   SCENE ELEMENT HELPERS
+   ══════════════════════════════════════════════════════ */
+
+/* Walking person silhouette */
+static void draw_person(float x,float y,float walk_phase,float dir,float cr,float cg,float cb){
+    glLineWidth(2.0f);
+    Col3(cr,cg,cb);
+    /* Head */
+    Circle(x,y+38,5,10);
+    /* Body */
+    Rect(x-3,y+10,6,26);
+    /* Legs - animated */
+    float leg=sinf(walk_phase)*8*dir;
+    glBegin(GL_LINES);
+    glVertex2f(x,y+12); glVertex2f(x-leg,y);
+    glVertex2f(x,y+12); glVertex2f(x+leg,y);
+    /* Arms */
+    glVertex2f(x,y+28); glVertex2f(x-6-leg*0.5f,y+18);
+    glVertex2f(x,y+28); glVertex2f(x+6+leg*0.5f,y+18);
+    glEnd();
+}
+
+/* Scurrying rat */
+static void draw_rat(float x,float y,float phase){
+    Col3(0.18f,0.15f,0.12f);
+    /* Body */
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex2f(x,y+3);
+    for(int i=0;i<=12;i++){
+        float a=PI*i/12.0f;
+        glVertex2f(x+cosf(a)*10,y+3+sinf(a)*5);
+    }
+    glEnd();
+    /* Head */
+    Circle(x+8*cosf(phase*0.1f),y+4,4,8);
+    /* Tail */
+    glLineWidth(1.5f);
+    Col3(0.25f,0.20f,0.15f);
+    glBegin(GL_LINE_STRIP);
+    for(int i=0;i<=6;i++){
+        float tt=(float)i/6;
+        glVertex2f(x-10-tt*12,y+3+sinf(phase+tt*4)*3);
+    }
+    glEnd();
+    /* Legs (tiny) */
+    float lp=sinf(phase*3)*2;
+    Col3(0.15f,0.12f,0.10f);
+    Line2(x-4,y+1,x-5+lp,y);
+    Line2(x+4,y+1,x+5-lp,y);
+}
+
+/* Streetlight with glow */
+static void draw_streetlight(float x,float y,float h,int on,float fa){
+    /* Pole */
+    Col3(0.3f,0.28f,0.25f);
+    Rect(x-3,y,6,h);
+    /* Arm */
+    Rect(x-2,y+h-3,20,6);
+    /* Lamp housing */
+    Col3(0.25f,0.23f,0.20f);
+    Rect(x+14,y+h-10,12,10);
+    /* Light */
+    if(on){
+        float flicker=0.85f+0.15f*sinf(gt*7+x*0.5f);
+        drawGlow(x+20,y+h-12,80*flicker, 1.0f,0.85f,0.4f);
+        drawLightCone(x+20,y+h-14, 270,55,120, 1.0f,0.85f,0.4f, flicker*fa);
+    }
+}
+
+/* Traffic light */
+static void draw_traffic_light(float x,float y,float fa){
+    /* Housing */
+    Col3(0.2f,0.2f,0.22f);
+    Rect(x-8,y,16,42);
+    /* Pole */
+    Col3(0.25f,0.25f,0.28f);
+    Rect(x-3,y-20,6,20);
+    /* Determine state: cycle every 8 seconds */
+    int cycle=(int)(gt/3)%3;
+    float glow=0.5f+0.5f*pulse(2.0f);
+    /* Red */
+    Col3(cycle==0?0.9f*glow:0.15f, 0.05f, 0.05f);
+    Circle(x,y+34,5,10);
+    if(cycle==0) drawGlow(x,y+34,18,1.0f,0.1f,0.05f);
+    /* Yellow */
+    Col3(cycle==1?0.9f*glow:0.15f, cycle==1?0.7f*glow:0.12f, 0.05f);
+    Circle(x,y+22,5,10);
+    if(cycle==1) drawGlow(x,y+22,15,1.0f,0.8f,0.1f);
+    /* Green */
+    Col3(0.05f, cycle==2?0.8f*glow:0.12f, 0.05f);
+    Circle(x,y+10,5,10);
+    if(cycle==2) drawGlow(x,y+10,18,0.1f,1.0f,0.2f);
+}
+
+/* Civilian car */
+static void draw_civilian_car(float x,float y,float dir,float cr,float cg,float cb){
+    glPushMatrix();
+    glTranslatef(x,y,0);
+    if(dir<0) glScalef(-1,1,1);
+    /* Body */
+    Col3(cr,cg,cb);
+    glBegin(GL_QUADS);
+    glVertex2f(-20,0); glVertex2f(20,0);
+    glVertex2f(18,10); glVertex2f(-18,10);
+    glEnd();
+    /* Cabin */
+    Col3(0.55f,0.78f,0.95f);
+    Rect(-10,10,20,8);
+    /* Wheels */
+    Col3(0.12f,0.12f,0.12f);
+    Circle(-12,-2,5,8);
+    Circle(12,-2,5,8);
+    /* Headlight */
+    BlendAdd();
+    Col4(1.0f,1.0f,0.6f,0.6f);
+    Circle(20,5,3,6);
+    /* Taillight */
+    Col4(1.0f,0.1f,0.05f,0.5f);
+    Circle(-20,5,3,6);
+    BlendOff();
+    glPopMatrix();
+}
+
+/* Bird in flight */
+static void draw_bird(float x,float y,float wing_phase){
+    glLineWidth(2.0f);
+    Col3(0.15f,0.12f,0.10f);
+    float w=sinf(wing_phase)*8;
+    glBegin(GL_LINE_STRIP);
+    glVertex2f(x-12,y-w*0.5f);
+    glVertex2f(x-4,y+w);
+    glVertex2f(x,y);
+    glVertex2f(x+4,y+w);
+    glVertex2f(x+12,y-w*0.5f);
+    glEnd();
+}
+
+/* Wind turbine */
+static void draw_wind_turbine(float x,float y,float h,float blade_angle){
+    /* Tower */
+    Col3(0.75f,0.75f,0.78f);
+    glBegin(GL_QUADS);
+    glVertex2f(x-6,y); glVertex2f(x+6,y);
+    glVertex2f(x+3,y+h); glVertex2f(x-3,y+h);
+    glEnd();
+    /* Hub */
+    Col3(0.8f,0.8f,0.82f);
+    Circle(x,y+h,8,12);
+    /* Blades */
+    Col3(0.90f,0.90f,0.92f);
+    for(int b=0;b<3;b++){
+        float ba=blade_angle+TAU*b/3.0f;
+        float bx=cosf(ba)*55, by=sinf(ba)*55;
+        glLineWidth(4.0f);
+        glBegin(GL_LINES);
+        glVertex2f(x,y+h);
+        glVertex2f(x+bx,y+h+by);
+        glEnd();
+        /* Blade shape */
+        glLineWidth(1.5f);
+        float perp_a=ba+PI/2;
+        float pw=4;
+        glBegin(GL_QUADS);
+        glVertex2f(x,y+h);
+        glVertex2f(x+cosf(perp_a)*pw,y+h+sinf(perp_a)*pw);
+        glVertex2f(x+bx+cosf(perp_a)*pw*0.3f,y+h+by+sinf(perp_a)*pw*0.3f);
+        glVertex2f(x+bx,y+h+by);
+        glEnd();
+    }
+}
+
+/* Rainbow arc */
+static void draw_rainbow(float cx,float cy,float radius,float alpha){
+    float colors[][3]={
+        {1.0f,0.2f,0.2f},{1.0f,0.5f,0.1f},{1.0f,0.9f,0.2f},
+        {0.2f,0.9f,0.3f},{0.2f,0.5f,1.0f},{0.3f,0.2f,0.8f},{0.5f,0.2f,0.7f}
+    };
+    BlendOn();
+    for(int c=0;c<7;c++){
+        float r=radius-c*8;
+        Col4(colors[c][0],colors[c][1],colors[c][2],alpha*0.35f);
+        glBegin(GL_QUAD_STRIP);
+        for(int i=0;i<=30;i++){
+            float a=PI*0.15f+PI*0.7f*i/30.0f;
+            glVertex2f(cx+cosf(a)*(r-6),cy+sinf(a)*(r-6));
+            glVertex2f(cx+cosf(a)*r,cy+sinf(a)*r);
+        }
+        glEnd();
+    }
+    BlendOff();
+}
+
+/* ══════════════════════════════════════════════════════
    SCENE 0 — CINEMATIC TITLE  (0–12s)
    ══════════════════════════════════════════════════════ */
 static void draw_title(void){
     float t=st(T0,T1);
     float fa=fade_alpha(T0,T1);
 
-    /* Deep space background */
-    RectGradV(0,0,W,H, 0.02f,0.04f,0.06f,1, 0.00f,0.02f,0.04f,1);
+    /* Breathing deep space background */
+    float breath=0.02f+0.008f*sinf(gt*0.8f);
+    RectGradV(0,0,W,H, 0.02f+breath,0.04f+breath,0.06f+breath*2,1,
+              0.00f,0.02f,0.04f,1);
 
-    /* Rotating hexagonal grid */
+    /* Rotating hexagonal grid with color wave */
     BlendOn();
-    float angle=gt*0.05f;
     for(int gx=-2;gx<=18;gx++){
         for(int gy=-2;gy<=12;gy++){
             float cx=gx*75.0f+35*(gy&1);
             float cy=gy*65.0f;
             float dist=sqrtf((cx-W/2.0f)*(cx-W/2.0f)+(cy-H/2.0f)*(cy-H/2.0f));
-            float brightness=0.05f+0.05f*sinf(dist*0.01f-gt*0.8f);
-            Col4(0.1f,0.6f,0.3f,brightness*fa);
+            float brightness=0.05f+0.06f*sinf(dist*0.01f-gt*0.8f);
+            float hue_shift=sinf(dist*0.005f+gt*0.3f)*0.3f;
+            Col4(0.1f+hue_shift*0.1f,0.6f,0.3f+hue_shift*0.2f,brightness*fa);
             CircleOutline(cx,cy,30,6,1.0f);
         }
     }
     BlendOff();
 
-    /* Central glowing orb */
-    BlendAdd();
+    /* Structured orbital rings */
+    BlendOn();
+    for(int ring=0;ring<3;ring++){
+        float rr=120+ring*40;
+        float speed=0.3f-ring*0.08f;
+        Col4(0.15f,0.8f,0.4f,0.12f*fa);
+        glLineWidth(1.0f);
+        CircleOutline(W/2.0f,H/2.0f+30,rr,48,1.0f);
+        /* Orbiting dots */
+        for(int d=0;d<4+ring*2;d++){
+            float a=gt*speed+TAU*d/(4+ring*2);
+            float ox=W/2.0f+cosf(a)*rr;
+            float oy=H/2.0f+30+sinf(a)*rr;
+            Col4(0.3f,1.0f,0.5f,0.6f*fa);
+            Circle(ox,oy,3+ring,8);
+            Col4(0.3f,1.0f,0.5f,0.15f*fa);
+            Circle(ox,oy,8+ring*2,12);
+        }
+    }
+    BlendOff();
+
+    /* Central glowing orb - enhanced with drawGlow */
     float orb_r=80+15*pulse(1.2f);
+    drawGlow(W/2.0f,H/2.0f+30,orb_r*1.2f, 0.1f,0.9f,0.4f);
+    BlendAdd();
     for(int ring=5;ring>=1;ring--){
         float rr=orb_r*ring/5.0f;
         float aa=0.12f*(6-ring)*fa;
@@ -282,10 +690,10 @@ static void draw_title(void){
     Col3(0.08f,0.5f,0.2f);
     Circle(W/2.0f,H/2.0f+30,48,48);
     Col3(0.05f,0.35f,0.15f);
-    /* Continents (simple blobs) */
     Circle(W/2.0f-15,H/2.0f+45,16,20);
     Circle(W/2.0f+12,H/2.0f+20,12,20);
     Circle(W/2.0f+5,H/2.0f+50,10,20);
+
     /* Recycling arrows around orb */
     glLineWidth(3.0f);
     for(int i=0;i<3;i++){
@@ -298,37 +706,56 @@ static void draw_title(void){
             glVertex2f(W/2.0f+cosf(a)*70,H/2.0f+30+sinf(a)*70);
         }
         glEnd();
-        /* Arrowhead */
         float ae=base+TAU/3.0f;
         float ax=W/2.0f+cosf(ae)*70, ay=H/2.0f+30+sinf(ae)*70;
-        float at=ae+PI/2.0f;
+        float at2=ae+PI/2.0f;
         Col4(0.3f,1.0f,0.5f,fa);
-        Tri(ax+cosf(at)*10,ay+sinf(at)*10,
-            ax-cosf(at)*10,ay-sinf(at)*10,
+        Tri(ax+cosf(at2)*10,ay+sinf(at2)*10,
+            ax-cosf(at2)*10,ay-sinf(at2)*10,
             ax+cosf(ae)*14,ay+sinf(ae)*14);
         BlendOff();
     }
 
-    /* Title */
+    /* Title — typewriter reveal */
     BlendOn();
-    Col4(0.2f,1.0f,0.5f,fa);
-    TextC(W/2.0f,H/2.0f-55,"URBAN WASTE MANAGEMENT",GLUT_BITMAP_TIMES_ROMAN_24);
-    Col4(1.0f,1.0f,1.0f,fa*0.85f);
-    TextC(W/2.0f,H/2.0f-85,"SMART CITIES  ·  ZERO WASTE  ·  SUSTAINABLE FUTURE",GLUT_BITMAP_HELVETICA_12);
-    Col4(0.5f,1.0f,0.6f,fa*0.6f*(0.5f+0.5f*sinf(gt*3)));
-    TextC(W/2.0f,H/2.0f-115,"A 5-MINUTE ANIMATION",GLUT_BITMAP_HELVETICA_12);
+    int title_chars=(int)(t*12*22);  /* reveal over first ~40% of scene */
+    int sub_chars=(int)((t-0.35f)*10*50);
+    if(sub_chars<0) sub_chars=0;
+    int anim_chars=(int)((t-0.6f)*8*20);
+    if(anim_chars<0) anim_chars=0;
 
-    /* Particle sparkles */
-    if(frand()<0.4f){
+    Col4(0.2f,1.0f,0.5f,fa);
+    TextCPartial(W/2.0f,H/2.0f-55,"URBAN WASTE MANAGEMENT",GLUT_BITMAP_TIMES_ROMAN_24,title_chars);
+
+    /* Glow behind title text */
+    if(title_chars>10){
+        drawGlow(W/2.0f,H/2.0f-50,200, 0.05f,0.3f,0.1f);
+    }
+
+    Col4(1.0f,1.0f,1.0f,fa*0.85f);
+    TextCPartial(W/2.0f,H/2.0f-85,"SMART CITIES  ·  ZERO WASTE  ·  SUSTAINABLE FUTURE",GLUT_BITMAP_HELVETICA_12,sub_chars);
+
+    Col4(0.5f,1.0f,0.6f,fa*0.6f*(0.5f+0.5f*sinf(gt*3)));
+    TextCPartial(W/2.0f,H/2.0f-115,"A 5-MINUTE ANIMATION",GLUT_BITMAP_HELVETICA_12,anim_chars);
+
+    /* Enhanced sparkle particles — spark type, zero gravity */
+    if(frand()<0.5f){
         float a=frand()*TAU;
-        float r=60+frand()*30;
-        SpawnParticle(W/2.0f+cosf(a)*r,H/2.0f+30+sinf(a)*r,
-                      cosf(a)*15,sinf(a)*15,1.5f,
-                      0.3f,1.0f,0.5f,3);
+        float r=60+frand()*40;
+        SpawnParticleEx(W/2.0f+cosf(a)*r,H/2.0f+30+sinf(a)*r,
+                        cosf(a)*20,sinf(a)*20,1.8f,
+                        0.3f,1.0f,0.5f,4, 2,0.3f,0.0f);
+    }
+    /* Dust motes in background */
+    if(frand()<0.3f){
+        SpawnParticleEx(frand()*W,frand()*H,
+                        (frand()-0.5f)*5,frand()*5,3.0f,
+                        0.2f,0.5f,0.3f,2, 5,0.1f,0.0f);
     }
     DrawParticles();
     BlendOff();
 }
+
 
 /* ══════════════════════════════════════════════════════
    SCENE 1 — THE PROBLEM: OVERFLOWING CITY WASTE (12–55s)
@@ -464,6 +891,8 @@ static void draw_problem_city(void){
     for(int tc=0;tc<6;tc++){
         float tcx=80+tc*210.0f;
         float tcy=130;
+        /* Shadow */
+        drawShadow(tcx,tcy-2,18,8);
         /* Can body */
         Col3(0.35f,0.32f,0.28f);
         Rect(tcx-12,tcy,24,45);
@@ -484,12 +913,86 @@ static void draw_problem_city(void){
         glPopMatrix();
     }
 
+    /* ─── STREETLIGHTS with glow ─── */
+    draw_streetlight(160,130,150,1,fa);
+    draw_streetlight(500,130,150,1,fa);
+    draw_streetlight(840,130,150,1,fa);
+    draw_streetlight(1120,130,150,1,fa);
+
+    /* ─── PEOPLE SILHOUETTES ─── */
+    BlendOn();
+    for(int p=0;p<6;p++){
+        float px=100+p*190.0f+sinf(gt*0.3f+p)*20;
+        float walk_p=gt*3.0f+p*1.5f;
+        float dir=(p%2)?1.0f:-1.0f;
+        draw_person(px,130,walk_p,dir, 0.12f,0.10f,0.08f);
+    }
+    BlendOff();
+
+    /* ─── RATS scurrying between piles ─── */
+    for(int r=0;r<3;r++){
+        float rat_x=fmodf(gt*45*(1+r*0.3f)+r*300,W+100)-50;
+        draw_rat(rat_x,132,gt*8+r*2);
+    }
+
+    /* ─── WIND-BLOWN DEBRIS (paper, leaves) ─── */
+    if(frand()<0.6f*pile_fill){
+        float wx=frand()*W;
+        SpawnParticleEx(wx,130+frand()*50,
+                        30+frand()*40, frand()*30+10,
+                        2.5f+frand()*2,
+                        0.6f,0.5f,0.3f, 4+frand()*3,
+                        3, 0.15f, -0.3f);  /* leaf type, slight upward float */
+    }
+    /* Dust from piles */
+    if(frand()<0.4f*pile_fill){
+        float dx=200+frand()*800;
+        SpawnParticleEx(dx,130,
+                        (frand()-0.5f)*15,frand()*8,
+                        1.5f, 0.5f,0.45f,0.3f,3, 5,0.2f,0.0f);
+    }
+    DrawParticles();
+
+    /* ─── BROKEN NEON SIGN ─── */
+    BlendOn();
+    float neon_flicker=sinf(gt*12)*sinf(gt*7.3f)*sinf(gt*3.1f);
+    float neon_on=(neon_flicker>-0.2f)?1.0f:0.0f;
+    neon_on*=clamp01(t*3); /* appears over time */
+    Col4(0.8f*neon_on,0.1f,0.1f,0.7f*fa*neon_on);
+    Text(730,440,"CLEAN CITY",GLUT_BITMAP_HELVETICA_18);
+    if(neon_on>0.5f){
+        drawGlow(790,445,60, 0.8f,0.1f,0.1f);
+    }
+    /* Strikethrough */
+    if(t>0.4f){
+        Col4(1.0f,0.2f,0.1f,0.9f*fa);
+        glLineWidth(3.0f);
+        Line2(720,448,870,448);
+    }
+    BlendOff();
+
+    /* ─── ENHANCED SMOG LAYERS ─── */
+    BlendOn();
+    /* Layer 1: low, fast */
+    for(int c=0;c<6;c++){
+        float cx3=fmodf(c*220+gt*12,W+200)-100;
+        Col4(0.4f,0.35f,0.20f,0.12f*smog*fa);
+        Circle(cx3,H*0.4f+c*15,70+c*10,20);
+    }
+    /* Layer 2: high, slow */
+    for(int c=0;c<5;c++){
+        float cx4=fmodf(c*280+gt*5,W+200)-100;
+        Col4(0.35f,0.30f,0.18f,0.08f*smog*fa);
+        Circle(cx4,H*0.7f+c*20,100+c*20,20);
+    }
+    BlendOff();
+
     /* Stat counter: waste growing */
     BlendOn();
     Col4(0,0,0,0.65f*fa);
     Rect(W-300,H-130,290,120);
     Col4(1.0f,0.35f,0.15f,fa);
-    Text(W-290,H-30,"⚠ WASTE CRISIS",GLUT_BITMAP_HELVETICA_18);
+    Text(W-290,H-30,"WASTE CRISIS",GLUT_BITMAP_HELVETICA_18);
     Col4(0.95f,0.9f,0.85f,fa*0.9f);
     char buf[80];
     sprintf(buf,"City waste: %.0f tons/day",1200+2800*pile_fill);
@@ -505,9 +1008,10 @@ static void draw_problem_city(void){
     Col4(1.0f,0.35f,0.15f,fa);
     Text(20,H-30,"SCENE 1: THE WASTE CRISIS",GLUT_BITMAP_HELVETICA_18);
     Col4(0.9f,0.85f,0.8f,fa*0.8f);
-    Text(20,H-55,"Poor management → overflowing landfills → urban pollution",GLUT_BITMAP_HELVETICA_12);
+    Text(20,H-55,"Poor management  |  overflowing landfills  |  urban pollution",GLUT_BITMAP_HELVETICA_12);
     BlendOff();
 }
+
 
 /* ══════════════════════════════════════════════════════
    SCENE 2 — SMART BIN NETWORK & IoT SENSORS (55–105s)
@@ -550,6 +1054,13 @@ static void draw_smart_bin(SmartBin*b, float reveal){
     Col4(0,0,0,0.3f);
     Circle(x,y-2,28,20);
     BlendOff();
+
+    /* Add bin wobble */
+    float bin_wobble = alert ? sinf(gt*15+b->signal_phase)*3 : 0;
+    glPushMatrix();
+    glTranslatef(x, y, 0);
+    glRotatef(bin_wobble, 0, 0, 1);
+    glTranslatef(-x, -y, 0);
 
     /* Bin body - trapezoid */
     glBegin(GL_QUADS);
@@ -644,19 +1155,63 @@ static void draw_iot_network(void){
     }
     BlendOff();
 
-    /* Central server icon */
+    /* Central server icon — enhanced */
     float srv_x=W/2.0f, srv_y=H*0.85f;
+    drawShadow(srv_x,srv_y-22,50,12);
     Col3(0.18f,0.22f,0.28f);
     Rect(srv_x-40,srv_y-20,80,40);
-    /* Server LEDs */
-    for(int sl=0;sl<4;sl++){
-        float sp=0.5f+0.5f*sinf(gt*2+sl*0.8f);
-        Col3(0.1f,sp,0.3f);
-        Circle(srv_x-25+sl*16,srv_y,4,8);
+    /* Server rack detail */
+    Col3(0.12f,0.15f,0.20f);
+    for(int sr=0;sr<3;sr++) Rect(srv_x-38,srv_y-18+sr*12,76,10);
+    /* Server LEDs — expanded array */
+    for(int sl=0;sl<8;sl++){
+        float sp=0.5f+0.5f*sinf(gt*3+sl*0.6f);
+        Col3(0.1f,sp*0.8f,0.3f);
+        Circle(srv_x-32+sl*9,srv_y+5,3,6);
     }
+    /* Cooling fan animation */
+    glPushMatrix();
+    glTranslatef(srv_x+25,srv_y-5,0);
+    glRotatef(gt*300,0,0,1);
+    Col3(0.3f,0.35f,0.4f);
+    for(int fb=0;fb<4;fb++){
+        float fa2=TAU*fb/4;
+        Line2(0,0,cosf(fa2)*10,sinf(fa2)*10);
+    }
+    glPopMatrix();
+
+    drawGlow(srv_x,srv_y,60, 0.1f,0.3f,0.6f);
     BlendOn();
     Col4(0.3f,0.7f,1.0f,0.8f);
     Text(srv_x-38,srv_y+28,"CITY SERVER",GLUT_BITMAP_HELVETICA_10);
+
+    /* Radar sweep on server */
+    {float sweep_a=fmodf(gt*1.5f,1.0f)*TAU;
+    Col4(0.2f,0.6f,1.0f,0.15f);
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex2f(srv_x,srv_y);
+    for(int rs=0;rs<=12;rs++){
+        float a=sweep_a-0.5f+0.5f*rs/12.0f;
+        glVertex2f(srv_x+cosf(a)*55,srv_y+sinf(a)*55);
+    }
+    glEnd();}
+    BlendOff();
+
+    /* ─── MESH NETWORK lines between neighboring bins ─── */
+    BlendOn();
+    glLineWidth(0.8f);
+    for(int i=0;i<16;i++){
+        for(int j=i+1;j<16;j++){
+            float dx=sbins[i].x-sbins[j].x;
+            float dy=sbins[i].y-sbins[j].y;
+            float dist=sqrtf(dx*dx+dy*dy);
+            if(dist<300){
+                float mesh_alpha=0.08f*(1-dist/300)*smoothstep(t)*fa;
+                Col4(0.2f,0.5f,0.8f,mesh_alpha);
+                Line2(sbins[i].x,sbins[i].y+35,sbins[j].x,sbins[j].y+35);
+            }
+        }
+    }
     BlendOff();
 
     /* Data lines from bins to server */
@@ -673,12 +1228,23 @@ static void draw_iot_network(void){
         glLineWidth(1.0f);
         Line2(b->x,b->y+35,srv_x,srv_y);
 
-        /* Data packet traveling */
+        /* Data packet traveling — enhanced with glow trail */
         if(b->fill>0.5f){
             float px=lerpf(b->x,srv_x,data_pulse);
             float py=lerpf(b->y+35,srv_y,data_pulse);
-            Col4(0.3f,0.9f,1.0f,0.8f*(1-data_pulse)*bin_reveal*fa);
-            Circle(px,py,4,8);
+            /* Trail */
+            for(int trail=3;trail>=1;trail--){
+                float tp=clamp01(data_pulse-trail*0.04f);
+                float tx=lerpf(b->x,srv_x,tp);
+                float ty=lerpf(b->y+35,srv_y,tp);
+                Col4(0.2f,0.7f,1.0f,0.2f*(4-trail)/3.0f*bin_reveal*fa);
+                Circle(tx,ty,3,6);
+            }
+            /* Main packet */
+            Col4(0.3f,0.9f,1.0f,0.9f*(1-data_pulse)*bin_reveal*fa);
+            Circle(px,py,5,8);
+            Col4(0.3f,0.9f,1.0f,0.3f*(1-data_pulse)*bin_reveal*fa);
+            Circle(px,py,10,10);
         }
         BlendOff();
 
@@ -698,6 +1264,7 @@ static void draw_iot_network(void){
         Text(b->x-18,b->y-10,bin_type_name[tp],GLUT_BITMAP_HELVETICA_10);
         BlendOff();
     }
+
 
     /* Legend panel */
     BlendOn();
@@ -942,21 +1509,32 @@ static void draw_collection_scene(void){
     DashLine(0,565,W,565,25,15,gt*0.18f);
     BlendOff();
 
+    /* ─── TRAFFIC LIGHTS at intersections ─── */
+    draw_traffic_light(95+15,120,fa);
+    draw_traffic_light(375+15,380,fa);
+    draw_traffic_light(655+15,120,fa);
+    draw_traffic_light(935+15,380,fa);
+
+    /* ─── CIVILIAN CARS on roads ─── */
+    {float car_colors[][3]={{0.6f,0.15f,0.15f},{0.15f,0.15f,0.6f},{0.5f,0.5f,0.15f},{0.15f,0.5f,0.15f},{0.5f,0.3f,0.1f}};
+    for(int cv=0;cv<5;cv++){
+        float cx=fmodf(gt*35*(1+cv*0.2f)+cv*250,W+100)-50;
+        float cy=(cv<2)?135:(cv<4)?395:565;
+        float dir=(cv%2)?1.0f:-1.0f;
+        draw_civilian_car(cx,cy,dir,car_colors[cv][0],car_colors[cv][1],car_colors[cv][2]);
+    }}
+
     /* Smart bins on streets */
     init_sbins();
     for(int i=0;i<16;i++){
         SmartBin*b=&sbins[i];
-        /* Reposition to street corners */
         float bx=b->x, by=b->y;
-        /* Map bin icons (small) */
         BlendOn();
         Col4(bin_cr[b->type],bin_cg[b->type],bin_cb[b->type],0.8f*fa);
         Rect(bx-6,by,12,18);
-        /* Fill level */
         Col4(bin_cr[b->type]*0.5f,bin_cg[b->type]*0.5f,bin_cb[b->type]*0.5f,0.9f);
         Rect(bx-6,by,12,18*b->fill);
-        /* Alert glow */
-        if(b->fill>0.75f){
+        if(b->fill>BIN_ALERT_THRESHOLD){
             float ag=0.5f+0.5f*sinf(gt*4+i);
             Col4(1.0f,0.2f,0.1f,ag*0.6f);
             Ring(bx,by+9,12,2,12);
@@ -967,12 +1545,30 @@ static void draw_collection_scene(void){
     /* Draw routes */
     draw_routes();
 
-    /* Draw trucks */
+    /* ─── GPS TRAIL behind trucks ─── */
+    BlendOn();
     for(int i=0;i<NTRUCK;i++){
-        draw_truck_vehicle(trucks[i].x,trucks[i].y,trucks[i].angle,
+        for(int trail=12;trail>=1;trail--){
+            float tp=gt-trail*0.15f;
+            if(tp<T3) continue;
+            /* Approximate past position using current direction */
+            float tx=trucks[i].x-cosf(trucks[i].angle*PI/180)*trail*5;
+            float ty=trucks[i].y-sinf(trucks[i].angle*PI/180)*trail*5;
+            float ta=0.4f*(1-trail/12.0f)*fa;
+            Col4(trucks[i].r,trucks[i].g,trucks[i].b,ta);
+            Circle(tx,ty,2.5f,6);
+        }
+    }
+    BlendOff();
+
+    /* Draw trucks — with suspension bounce */
+    for(int i=0;i<NTRUCK;i++){
+        float bounce=sinf(gt*12+i*2.5f)*SECONDARY_MOTION_AMP;
+        draw_truck_vehicle(trucks[i].x,trucks[i].y+bounce,trucks[i].angle,
                            trucks[i].r,trucks[i].g,trucks[i].b,trucks[i].label);
     }
     DrawParticles();
+
 
     /* Collection event animations */
     for(int i=0;i<16;i++){
@@ -1153,7 +1749,7 @@ static void draw_sorting_facility(void){
     int item_shapes[][2]={ {0,0},{1,0},{2,0},{3,0},{0,1},{1,1},{2,1},{3,1} };
     for(int it=0;it<NSORTING_ITEMS;it++){
         float ix=fmodf(belt_phase2+it*(W/NSORTING_ITEMS),W);
-        float iy=belt_y;
+        float iy=belt_y + sinf(gt*20+it*3.1f)*1.5f; /* item vibration */
         int tp=it%4;
         Col3(bin_cr[tp],bin_cg[tp],bin_cb[tp]);
         /* Different shapes for different waste */
@@ -1169,27 +1765,70 @@ static void draw_sorting_facility(void){
                 Rect(ix-4,iy-12,8,20);
                 Circle(ix,iy-12,4,8); break;
         }
-        /* Highlight when under sorting arm */
+        /* AI Detection overlay when under sorting arm */
         for(int a=0;a<4;a++){
             if(fabsf(ix-arm_x[a])<30 && a==tp){
+                /* Detection box */
+                BlendOn();
+                Col4(arm_cr[a],arm_cg[a],arm_cb[a],0.7f);
+                glLineWidth(2.0f);
+                /* Animated box corners */
+                float bsz=18+2*sinf(gt*6);
+                /* Top-left corner */
+                Line2(ix-bsz,iy+bsz,ix-bsz+8,iy+bsz);
+                Line2(ix-bsz,iy+bsz,ix-bsz,iy+bsz-8);
+                /* Top-right */
+                Line2(ix+bsz,iy+bsz,ix+bsz-8,iy+bsz);
+                Line2(ix+bsz,iy+bsz,ix+bsz,iy+bsz-8);
+                /* Bottom-left */
+                Line2(ix-bsz,iy-bsz,ix-bsz+8,iy-bsz);
+                Line2(ix-bsz,iy-bsz,ix-bsz,iy-bsz+8);
+                /* Bottom-right */
+                Line2(ix+bsz,iy-bsz,ix+bsz-8,iy-bsz);
+                Line2(ix+bsz,iy-bsz,ix+bsz,iy-bsz+8);
+                /* Detection label */
+                Col4(arm_cr[a],arm_cg[a],arm_cb[a],0.9f);
+                char det_buf[32];
+                sprintf(det_buf,"AI: %s",arm_label[a]);
+                Text(ix-18,iy+bsz+8,det_buf,GLUT_BITMAP_HELVETICA_10);
                 BlendAdd();
-                Col4(arm_cr[a],arm_cg[a],arm_cb[a],0.5f);
-                Circle(ix,iy,15,12);
+                Col4(arm_cr[a],arm_cg[a],arm_cb[a],0.3f);
+                Circle(ix,iy,bsz*0.8f,12);
                 BlendOff();
             }
         }
     }
 
+    /* ─── SCANNING LINE across conveyor ─── */
+    BlendOn();
+    float scan_x=fmodf(gt*120,W);
+    Col4(0.2f,1.0f,0.3f,0.4f);
+    glLineWidth(1.5f);
+    Line2(scan_x,belt_y-25,scan_x,belt_y+25);
+    Col4(0.2f,1.0f,0.3f,0.1f);
+    Rect(scan_x-15,belt_y-25,30,50);
+    BlendOff();
+
     /* ─── FACILITY STRUCTURE ─── */
     /* Ceiling / roof */
     Col3(0.18f,0.18f,0.22f);
     Rect(0,H-80,W,80);
-    /* Support pillars */
+    /* Support pillars with safety beacons */
     for(int p=0;p<7;p++){
         Col3(0.25f,0.25f,0.30f);
         Rect(p*200-10,110,20,H-180);
         Col3(0.40f,0.40f,0.45f);
         Rect(p*200-15,H-90,30,10);
+        /* Rotating amber safety beacon */
+        BlendOn();
+        float beacon_phase=gt*4+p*1.2f;
+        float beacon_bright=clamp01(sinf(beacon_phase));
+        Col4(1.0f,0.7f,0.1f,beacon_bright*0.6f);
+        Circle(p*200,H-85,6,8);
+        if(beacon_bright>0.5f){
+            drawGlow(p*200,H-85,25, 1.0f,0.7f,0.1f);
+        }
+        BlendOff();
     }
     /* Overhead crane */
     glLineWidth(3.0f);
@@ -1202,16 +1841,17 @@ static void draw_sorting_facility(void){
     Line2(0,H-70,W,H-70);
     BlendOff();
 
-    /* Sparks from machinery */
+    /* Sparks from machinery — upgrade to spark type */
     if(frand()<0.4f){
         float sx=arm_x[(int)(frand()*4)];
         for(int sp=0;sp<3;sp++){
-            SpawnParticle(sx,belt_y+70,
+            SpawnParticleEx(sx,belt_y+70,
                           (frand()-0.5f)*80,(frand())*60+20,
-                          0.5f, 1.0f,0.8f,0.2f,3);
+                          0.5f, 1.0f,0.8f,0.2f,3, 2,0.2f,1.0f);
         }
     }
     DrawParticles();
+
 
     /* ─── RECYCLING STATS ─── */
     BlendOn();
@@ -1296,17 +1936,36 @@ static void draw_energy_plant(void){
     RectGradV(0,0,W,200, 0.0f,0.0f,0.0f,0, 0.3f,0.12f,0.0f,0.3f*fa);
     BlendOff();
 
-    /* Stars */
+    /* Stars and City Skyline */
     srand(99);
     for(int s=0;s<120;s++){
         float sx=(float)(s*137%W),sy=250+(float)(s*97%450);
         float tw=0.3f+0.7f*fabsf(sinf(gt*1.5f+s*0.4f));
         BlendOn();
-        Col4(1,1,0.9f,tw*0.6f);
+        Col4(1,1,0.9f,tw*0.6f*fa);
         glPointSize(tw*2.5f);
         glBegin(GL_POINTS); glVertex2f(sx,sy); glEnd();
         BlendOff();
     }
+
+    /* ─── CITY SKYLINE (Background) ─── */
+    BlendOn();
+    for(int b=0;b<30;b++){
+        float bx=b*45.0f;
+        float bw=30+sinf(b*123.456f)*20;
+        float bh=80+sinf(b*987.654f)*100;
+        /* Distant haze fades the buildings in */
+        Col4(0.06f,0.07f,0.09f,0.8f*fa);
+        Rect(bx,80,bw,bh);
+        /* Simple windows in skyline */
+        for(int wy=100;wy<80+bh-10;wy+=15){
+            if(sinf(b*12+wy*4)>0.5f){
+                Col4(0.8f,0.6f,0.2f,0.3f*fa);
+                Rect(bx+bw*0.3f,wy,bw*0.4f,8);
+            }
+        }
+    }
+    BlendOff();
 
     /* Ground */
     RectGradV(0,0,W,80, 0.15f,0.14f,0.12f,1, 0.20f,0.18f,0.15f,1);
@@ -1327,6 +1986,7 @@ static void draw_energy_plant(void){
             float wglow=0.5f+0.5f*sinf(gt*0.5f+wr*0.4f+wc*0.3f);
             Col3(wglow,wglow*0.5f,0.0f);
             Rect(265+wc*65,145+wr*48,45,30);
+            if (wglow > 0.8f) drawGlow(265+wc*65+22, 145+wr*48+15, 30, wglow, wglow*0.5f, 0.0f);
         }
     }
     for(int wr=0;wr<4;wr++){
@@ -1354,6 +2014,15 @@ static void draw_energy_plant(void){
 
         /* Smoke plumes from top */
         draw_smoke_plume(cx,80+ch2+12);
+        
+        /* Ember particles rising from chimneys */
+        if(frand()<0.3f){
+            SpawnParticleEx(cx+(frand()-0.5f)*20, 80+ch2,
+                            (frand()-0.5f)*10, 40+frand()*40, 
+                            2.0f+frand()*2.0f,
+                            1.0f, 0.5f+frand()*0.3f, 0.0f, 3+frand()*3,
+                            6, 0.0f, -0.4f); /* ember type, float up */
+        }
     }
 
     /* ─── TURBINE GENERATORS ─── */
@@ -1361,14 +2030,16 @@ static void draw_energy_plant(void){
         float tx=300+tg*220.0f;
         float ty=155;
         /* Generator housing */
+        drawShadow(tx+60,ty-10,60,15);
         Col3(0.4f,0.38f,0.35f);
         Rect(tx,ty,120,60);
         Col3(0.50f,0.48f,0.44f);
         Rect(tx+10,ty+10,100,40);
+        
         /* Spinning turbine */
         glPushMatrix();
         glTranslatef(tx+60,ty+30,0);
-        glRotatef(gt*200,0,0,1);
+        glRotatef(gt*300,0,0,1);
         Col3(0.6f,0.6f,0.65f);
         for(int bl=0;bl<6;bl++){
             float ba=TAU*bl/6;
@@ -1383,6 +2054,10 @@ static void draw_energy_plant(void){
             glEnd();
         }
         glPopMatrix();
+        
+        /* Energy glow inside turbine */
+        drawGlow(tx+60,ty+30, 40, 0.4f,0.8f,1.0f);
+
         /* Output cables */
         glLineWidth(3.0f);
         BlendOn();
@@ -1390,12 +2065,12 @@ static void draw_energy_plant(void){
         Line2(tx+60,ty,tx+60,ty-40);
         Line2(tx+60,ty-40,tx+200,ty-40);
         /* Electricity arc effect */
-        glLineWidth(1.5f);
-        Col4(0.8f,0.9f,1.0f,0.4f+0.4f*pulse(8+tg));
+        glLineWidth(2.0f);
+        Col4(0.5f,0.8f,1.0f,0.6f+0.4f*pulse(8+tg));
         glBegin(GL_LINE_STRIP);
         for(int ep=0;ep<=10;ep++){
             float ex=tx+60+(140.0f*ep/10);
-            float ey=ty-40+sinf(gt*15+ep*0.8f+tg)*6;
+            float ey=ty-40+sinf(gt*20+ep*0.8f+tg)*8;
             glVertex2f(ex,ey);
         }
         glEnd();
@@ -1408,6 +2083,7 @@ static void draw_energy_plant(void){
     Rect(980,80,15,260);
     Rect(960,250,55,8);
     Rect(960,320,55,8);
+    
     /* Wires */
     BlendOn();
     Col4(0.5f,0.5f,0.55f,0.8f);
@@ -1415,15 +2091,31 @@ static void draw_energy_plant(void){
     Line2(995,345,W,380);
     Line2(995,325,W,360);
     Line2(995,258,W,280);
+    
     /* Energy flow particles along wire */
-    for(int ef=0;ef<5;ef++){
-        float ep=fmodf(gt*0.8f+ef*0.2f,1.0f);
+    for(int ef=0;ef<8;ef++){
+        float ep=fmodf(gt*1.5f+ef*0.125f,1.0f);
         float ex=lerpf(995,W,ep);
         float ey=lerpf(345,380,ep);
-        Col4(1.0f,0.9f,0.2f,1-ep);
-        Circle(ex,ey,5,8);
+        drawGlow(ex,ey, 25, 0.4f,0.8f,1.0f);
+        Col4(0.8f,1.0f,1.0f,1-ep);
+        Circle(ex,ey,6,8);
+    }
+    for(int ef=0;ef<8;ef++){
+        float ep=fmodf(gt*1.3f+ef*0.125f,1.0f);
+        float ex=lerpf(995,W,ep);
+        float ey=lerpf(325,360,ep);
+        drawGlow(ex,ey, 20, 0.4f,0.8f,1.0f);
+    }
+    for(int ef=0;ef<8;ef++){
+        float ep=fmodf(gt*1.7f+ef*0.125f,1.0f);
+        float ex=lerpf(995,W,ep);
+        float ey=lerpf(258,280,ep);
+        drawGlow(ex,ey, 20, 0.4f,0.8f,1.0f);
     }
     BlendOff();
+    
+    DrawParticles();
 
     /* ─── INFO PANEL ─── */
     BlendOn();
@@ -1565,7 +2257,29 @@ static void draw_dashboard(void){
     Line2(W*0.75f,H*0.55f,W*0.75f,H);
     BlendOff();
 
-    /* ─── TOP LEFT: Arc Gauges ─── */
+    /* ─── CLOCK WIDGET (Center Hub) ─── */
+    BlendOn();
+    Col4(0.08f,0.1f,0.15f,0.9f*fa);
+    Circle(W/2.0f, H*0.55f, 40, 32);
+    Col4(0.2f,0.8f,1.0f,0.8f*fa);
+    CircleOutline(W/2.0f, H*0.55f, 40, 32, 3.0f);
+    /* Clock ticks */
+    for(int tk=0;tk<12;tk++){
+        float tka=TAU*tk/12;
+        Line2(W/2.0f+cosf(tka)*32, H*0.55f+sinf(tka)*32,
+              W/2.0f+cosf(tka)*38, H*0.55f+sinf(tka)*38);
+    }
+    /* Clock hands */
+    glLineWidth(2.5f);
+    Col4(1.0f,1.0f,1.0f,0.9f*fa);
+    Line2(W/2.0f, H*0.55f, W/2.0f+cosf(gt*0.5f)*20, H*0.55f+sinf(gt*0.5f)*20); /* hour */
+    glLineWidth(1.5f);
+    Col4(0.3f,0.9f,1.0f,0.9f*fa);
+    Line2(W/2.0f, H*0.55f, W/2.0f+cosf(gt*6.0f)*32, H*0.55f+sinf(gt*6.0f)*32);  /* minute */
+    BlendOff();
+
+    /* ─── LEFT PANEL: Arc Gauges ─── */
+    float fill_anim = smoothstep((t - 0.1f) * 3.0f); /* animate 0->1 */
     float gauge_vals[]={
         0.62f+0.2f*sinf(gt*0.3f),
         0.78f+0.1f*sinf(gt*0.4f+1),
@@ -1574,27 +2288,31 @@ static void draw_dashboard(void){
     };
     const char* glabels[]={"RECYCLING","DIVERSION","RECOVERY","EFFICIENCY"};
     char gvals[4][12];
-    sprintf(gvals[0],"%.0f%%",gauge_vals[0]*100);
-    sprintf(gvals[1],"%.0f%%",gauge_vals[1]*100);
-    sprintf(gvals[2],"%.0f%%",gauge_vals[2]*100);
-    sprintf(gvals[3],"%.0f%%",gauge_vals[3]*100);
+    sprintf(gvals[0],"%.0f%%",gauge_vals[0]*fill_anim*100);
+    sprintf(gvals[1],"%.0f%%",gauge_vals[1]*fill_anim*100);
+    sprintf(gvals[2],"%.0f%%",gauge_vals[2]*fill_anim*100);
+    sprintf(gvals[3],"%.0f%%",gauge_vals[3]*fill_anim*100);
     float gcx[]={120,300,480,W/2.0f-60};
     float gcr2[]={0.2f,0.9f,0.15f,0.4f};
     float gcg2[]={0.9f,0.6f,0.8f,0.8f};
     float gcb2[]={0.2f,0.1f,0.2f,1.0f};
     for(int g=0;g<4;g++){
-        draw_arc_gauge(gcx[g],H*0.3f,70,gauge_vals[g],
+        draw_arc_gauge(gcx[g],H*0.3f,70,gauge_vals[g] * fill_anim,
                        gcr2[g],gcg2[g],gcb2[g],glabels[g],gvals[g]);
     }
 
-    /* ─── TOP RIGHT: Line graphs ─── */
+    /* ─── RIGHT PANEL: Line graphs ─── */
     float waste_data[12]={ 0.9f,0.85f,0.82f,0.78f,0.72f,0.68f,0.62f,0.55f,0.48f,0.40f,0.32f,0.25f };
     float recycle_data[12]={ 0.1f,0.15f,0.18f,0.25f,0.32f,0.38f,0.45f,0.52f,0.60f,0.68f,0.75f,0.82f };
-    float energy_data[12]={ 0.3f,0.32f,0.35f,0.40f,0.45f,0.50f,0.55f,0.60f,0.65f,0.70f,0.75f,0.80f };
+    
+    /* Progressive drawing of graphs */
+    int graph_pts = (int)(fill_anim * 12);
+    if(graph_pts < 2) graph_pts = 2; /* Need at least 2 points to draw line */
+    if(graph_pts > 12) graph_pts = 12;
 
     float gx=W*0.52f, gy=H*0.05f, gw=W*0.45f, gh=H*0.22f;
-    draw_line_graph_s6(gx,gy+gh*1.3f,gw,gh*0.9f,waste_data,12,1.0f,0.35f,0.1f);
-    draw_line_graph_s6(gx,gy,gw,gh*0.9f,recycle_data,12,0.2f,0.9f,0.3f);
+    draw_line_graph_s6(gx,gy+gh*1.3f,gw,gh*0.9f,waste_data,graph_pts,1.0f,0.35f,0.1f);
+    draw_line_graph_s6(gx,gy,gw,gh*0.9f,recycle_data,graph_pts,0.2f,0.9f,0.3f);
 
     BlendOn();
     Col4(1.0f,0.35f,0.1f,0.9f);
@@ -1612,7 +2330,7 @@ static void draw_dashboard(void){
     Text(gx+4,gy+gh*0.9f+12,"RECYCLING RATE TREND",GLUT_BITMAP_HELVETICA_10);
     BlendOff();
 
-    /* ─── BOTTOM PANELS ─── */
+    /* ─── TOP PANELS ─── */
     struct{ const char*name; float val; float cr,cg,cb; const char*unit; } kpis[]={
         {"Landfill Diversion",  0.92f, 0.2f,0.9f,0.3f, "92%"},
         {"Carbon Footprint",    0.28f, 0.4f,0.7f,1.0f, "-72%"},
@@ -1668,11 +2386,18 @@ static void draw_tree(float x,float y,float h,float lush){
         float lb=lerpf(0.05f,0.12f,lt);
         Col3(lr,lg,lb);
         float rr=(h*0.35f-l*h*0.06f)*(0.9f+0.1f*sinf(gt*0.8f+x*0.02f+l));
-        Circle(x,y+h*0.4f+l*h*0.15f,rr,16);
+        float sway = sinf(gt * 1.5f + x * 0.05f + l*0.5f) * l * 3.0f; /* Canopy sway */
+        Circle(x+sway, y+h*0.4f+l*h*0.15f, rr, 16);
     }
 }
 
 static void draw_solar_panel(float x,float y,float w,float h){
+    float tilt_angle = 5 * sinf(gt * 0.5f); /* Sun tracking subtle tilt */
+    glPushMatrix();
+    glTranslatef(x+w/2, y+h/2, 0);
+    glRotatef(tilt_angle, 0, 0, 1);
+    glTranslatef(-(x+w/2), -(y+h/2), 0);
+
     Col3(0.08f,0.10f,0.30f);
     Rect(x,y,w,h);
     /* Grid lines */
@@ -1686,6 +2411,7 @@ static void draw_solar_panel(float x,float y,float w,float h){
     Col4(0.4f,0.5f,1.0f,sh);
     Rect(x,y+h*0.3f,w,h*0.1f);
     BlendOff();
+    glPopMatrix();
 }
 
 static void draw_future_city(void){
@@ -1696,6 +2422,9 @@ static void draw_future_city(void){
     RectGradV(0,0,W,H,
               lerpf(0.35f,0.55f,t),lerpf(0.60f,0.80f,t),lerpf(0.80f,0.95f,t),1,
               0.65f,0.85f,0.65f,1);
+
+    /* Rainbow arc appearing */
+    draw_rainbow(W/2.0f,150,550,clamp01(t*2)*fa);
 
     /* Sun */
     BlendAdd();
@@ -1710,6 +2439,17 @@ static void draw_future_city(void){
         Col4(1.0f,0.9f,0.5f,0.4f);
         Line2(W-150+cosf(ra)*50,H-80+sinf(ra)*50,
               W-150+cosf(ra)*90,H-80+sinf(ra)*90);
+    }
+    BlendOff();
+
+    /* Birds in V-formation */
+    BlendOn();
+    float bx_base=fmodf(gt*60,W+300)-150;
+    float by_base=H*0.75f+sinf(gt)*20;
+    for(int bird=0;bird<7;bird++){
+        float bx_off=bird*15;
+        float by_off=abs(bird-3)*15;
+        draw_bird(bx_base-bx_off,by_base-by_off,gt*8+bird*0.5f);
     }
     BlendOff();
 
@@ -1752,6 +2492,12 @@ static void draw_future_city(void){
     }
     glEnd();
 
+    /* Wind turbines on hills */
+    draw_wind_turbine(250,140,80,gt*2.0f);
+    draw_wind_turbine(450,150,90,gt*2.0f+PI/3);
+    draw_wind_turbine(850,145,100,gt*2.0f+PI/6);
+    draw_wind_turbine(1050,135,70,gt*2.0f+PI/2);
+    
     /* Ground */
     RectGradV(0,0,W,90, 0.25f,0.60f,0.25f,1, 0.35f,0.72f,0.30f,1);
 
@@ -1977,6 +2723,7 @@ static void draw_hud(void){
 
     /* Progress bar */
     float prog=gt/T8;
+    /* Progress bar background */
     Col4(0,0,0,0.6f);
     Rect(0,0,W,10);
     /* Gradient progress */
@@ -1989,14 +2736,27 @@ static void draw_hud(void){
     Rect(W*prog-6,0,12,10);
     BlendOff();
 
-    /* Scene tick marks */
-    for(int sc=1;sc<=7;sc++){
-        float tx=W*scene_starts[sc]/T8;
-        Col4(1.0f,1.0f,0.4f,0.8f);
-        Rect(tx-1,0,2,10);
-        /* Scene number dot */
-        Col4(0.3f,0.8f,0.5f,0.7f);
-        Circle(tx,5,3,6);
+    /* Scene thumbnail strip/timeline */
+    for(int sc=0;sc<8;sc++){
+        float st = scene_starts[sc];
+        float en = (sc == 7) ? T8 : scene_starts[sc+1];
+        float t_start = W * st / T8;
+        float t_end = W * en / T8;
+        float t_width = t_end - t_start;
+
+        if(sc == scene){
+            /* Highlight active scene timeline chunk */
+            BlendAdd();
+            Col4(1.0f, 1.0f, 1.0f, 0.25f + 0.15f*sinf(gt*5));
+            Rect(t_start, 0, t_width, 10);
+            BlendOff();
+        }
+
+        /* Scene dividers */
+        BlendOn();
+        Col4(0.0f, 0.0f, 0.0f, 0.8f);
+        Rect(t_start-1, 0, 2, 10);
+        BlendOff();
     }
 
     /* Pause indicator */
@@ -2034,6 +2794,24 @@ static void display(void){
     glLoadIdentity();
 
     update_scene();
+
+    /* ─── CAMERA PAN & SHAKE ─── */
+    glPushMatrix();
+    /* Subtle handheld camera float */
+    glTranslatef(sinf(gt*0.8f)*1.5f, cosf(gt*1.1f)*1.0f, 0);
+
+    /* Shake logic (explosions, sorting impacts, furnace rumble) */
+    float shake_x = 0, shake_y = 0;
+    if(scene == 4 && sinf(gt*20) > 0.8f) { /* sorting arms */
+        shake_x = (frand() - 0.5f) * 1.5f;
+        shake_y = (frand() - 0.5f) * 1.5f;
+    }
+    if(scene == 5 && frand() < 0.2f) { /* furnace combustion */
+        shake_x = (frand() - 0.5f) * 1.5f;
+        shake_y = (frand() - 0.5f) * 1.5f;
+    }
+    glTranslatef(shake_x, shake_y, 0);
+
     switch(scene){
         case 0: draw_title();           break;
         case 1: draw_problem_city();    break;
@@ -2044,6 +2822,9 @@ static void display(void){
         case 6: draw_dashboard();       break;
         case 7: draw_future_city();     break;
     }
+    glPopMatrix();
+
+    drawVignette();
     draw_hud();
     glutSwapBuffers();
 }
