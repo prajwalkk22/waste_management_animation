@@ -238,7 +238,7 @@ static void drawGlow(float x,float y,float r,float cr,float cg,float cb){
     BlendAdd();
     for(int i=GLOW_LAYERS;i>=1;i--){
         float rr=r*i/(float)GLOW_LAYERS;
-        float a=0.07f*(GLOW_LAYERS+1-i);
+        float a=0.04f*(GLOW_LAYERS+1-i);
         Col4(cr,cg,cb,a);
         Circle(x,y,rr,24);
     }
@@ -680,7 +680,7 @@ static void draw_title(void){
     BlendAdd();
     for(int ring=5;ring>=1;ring--){
         float rr=orb_r*ring/5.0f;
-        float aa=0.12f*(6-ring)*fa;
+        float aa=0.06f*(6-ring)*fa;
         Col4(0.1f,0.9f,0.4f,aa);
         Circle(W/2.0f,H/2.0f+30,rr,48);
     }
@@ -724,13 +724,13 @@ static void draw_title(void){
     int anim_chars=(int)((t-0.6f)*8*20);
     if(anim_chars<0) anim_chars=0;
 
-    Col4(0.2f,1.0f,0.5f,fa);
-    TextCPartial(W/2.0f,H/2.0f-55,"URBAN WASTE MANAGEMENT",GLUT_BITMAP_TIMES_ROMAN_24,title_chars);
-
     /* Glow behind title text */
     if(title_chars>10){
-        drawGlow(W/2.0f,H/2.0f-50,200, 0.05f,0.3f,0.1f);
+        drawGlow(W/2.0f,H/2.0f-50,140, 0.05f,0.3f,0.1f);
     }
+
+    Col4(0.2f,1.0f,0.5f,fa);
+    TextCPartial(W/2.0f,H/2.0f-55,"URBAN WASTE MANAGEMENT",GLUT_BITMAP_TIMES_ROMAN_24,title_chars);
 
     Col4(1.0f,1.0f,1.0f,fa*0.85f);
     TextCPartial(W/2.0f,H/2.0f-85,"SMART CITIES  ·  ZERO WASTE  ·  SUSTAINABLE FUTURE",GLUT_BITMAP_HELVETICA_12,sub_chars);
